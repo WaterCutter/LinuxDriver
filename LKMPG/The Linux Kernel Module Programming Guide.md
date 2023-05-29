@@ -74,3 +74,88 @@ crw-rw----  1 root  dial 4, 67 Jul  5  2000 /dev/ttyS3
 如果要查看已分配的主要编号，可以查看：[Documentation/admin-guide/devices.txt.](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/Documentation/admin-guide/devices.txt)
 
 安装系统时，所有这些设备文件都是由 `mknod` 命令创建的。要创建一个名为 coffee 的新字符设备，主要/次要编号为 12 和 2，只需执行 `mknod /dev/coffee c 12 2` 。您不必将设备文件放入 `/dev` 中，但这是按照惯例完成的。Linus 将他的设备文件放在 `/dev` 中，你也应该如此。但是，在创建用于测试目的的设备文件时，可能可以将其放在编译内核模块的工作目录中。只需确保在编写完设备驱动程序后将其放在正确的位置即可。
+
+# 6 字符设备驱动
+
+[include/linux/fs.h](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/fs.h) 中定义了结构体 `file_operations` ，这个结构体包含指向再设备上执行各种操作的系列函数。结构体的每一字段都对应着驱动中定义的处理请求的函数的地址。
+
+
+> 所谓“每一字段对应驱动中...的函数的地址”，即是说 `file_operations` 中包含一系列的函数指针，指向模块中具体的函数实现。可以把这个结构体理解为设备的操作清单，编写驱动时只需要根据实际需要实现清单中的部分接口就行了。
+
+
+```c
+struct file_operations { 
+    struct module *owner; 
+    loff_t (*llseek) (struct file *, loff_t, int); 
+    ssize_t (*read) (struct file *, char __user *, size_t, loff_t *); 
+    ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *); 
+    ssize_t (*read_iter) (struct kiocb *, struct iov_iter *); 
+    ssize_t (*write_iter) (struct kiocb *, struct iov_iter *); 
+    int (*iopoll)(struct kiocb *kiocb, bool spin); 
+    int (*iterate) (struct file *, struct dir_context *); 
+    int (*iterate_shared) (struct file *, struct dir_context *); 
+    __poll_t (*poll) (struct file *, struct poll_table_struct *); 
+    long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long); 
+    long (*compat_ioctl) (struct file *, unsigned int, unsigned long); 
+    int (*mmap) (struct file *, struct vm_area_struct *); 
+    unsigned long mmap_supported_flags; 
+    int (*open) (struct inode *, struct file *); 
+    int (*flush) (struct file *, fl_owner_t id); 
+    int (*release) (struct inode *, struct file *); 
+    int (*fsync) (struct file *, loff_t, loff_t, int datasync); 
+    int (*fasync) (int, struct file *, int); 
+    int (*lock) (struct file *, int, struct file_lock *); 
+    ssize_t (*sendpage) (struct file *, struct page *, int, size_t, loff_t *, int); 
+    unsigned long (*get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long); 
+    int (*check_flags)(int); 
+    int (*flock) (struct file *, int, struct file_lock *); 
+    ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int); 
+    ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int); 
+    int (*setlease)(struct file *, long, struct file_lock **, void **); 
+    long (*fallocate)(struct file *file, int mode, loff_t offset, 
+        loff_t len); 
+    void (*show_fdinfo)(struct seq_file *m, struct file *f); 
+    ssize_t (*copy_file_range)(struct file *, loff_t, struct file *, 
+        loff_t, size_t, unsigned int); 
+    loff_t (*remap_file_range)(struct file *file_in, loff_t pos_in, 
+             struct file *file_out, loff_t pos_out, 
+             loff_t len, unsigned int remap_flags); 
+    int (*fadvise)(struct file *, loff_t, loff_t, int); 
+} __randomize_layout;
+```
+
+某些操作不会在驱动中实现（implemeted by a driver）。例如声卡驱动不需要实现从目录结构中读取的接口，那么这个驱动提供的 `file_operations` 结构体中的相关指针就可以设为 `NULL`。
+
+GCC 扩展（gcc extension）支持便捷的结构体初始化方式（即内核中常用的乱序初始化），用法形如：
+
+```c
+struct file_operations fops = { 
+    read: device_read, 
+    write: device_write, 
+    open: device_open, 
+    release: device_release 
+};
+```
+
+或者使用 C99 风格的 [designed initilizers](https://gcc.gnu.org/onlinedocs/gcc/Designated-Inits.html) 初始化结构体。
+
+
+`file_operations` 中包含的用于实现read、write等系统调用的函数，通常被称为 `fops`。
+
+从 3.14 版内核开始， read、write、seek等操作`fops` 就已经有线程安全的（thread-safe）特定锁（specific lock）保护了，这使得文件位置更新（file position update）是互斥的（mutual exclusion）。所以我们在实现这些操作的时候不需要类似目的的锁（unnecessary locking）。
+
+> 在计算机中，文件位置更新是指将文件指针移动到文件中的特定位置。
+
+此外，从 5.6 版开始，开发者向内核引入了 `proc_ops` 结构体，在注册 proc handlers 时不在使用 `file_operations` 结构体。
+
+> 在计算机操作系统中，进程处理程序（proc handlers）是一种用于处理进程中断和异常的机制。主要作用是保证进程的正常运行和安全性。当进程发生中断或异常时，进程处理程序可以采取适当的措施来处理这些事件，例如重新启动进程、恢复进程状态、记录日志等。
+
+### 6.2 File 结构体
+
+每个设备在内核中都由一个 `struct file` 结构体表示，这个结构体定义在文件 [include/linux/fs.h.](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/fs.h)中。
+
+这个结构体不是用户程序常用的 glibc 中定义的 `FILE`。另外这个结构体的命名有些误导作用，它指的是抽象的打开的文件，而非用 `inode` 指代的磁盘文件。
+
+`struct file` 的指针（instance）通常被称为 `filp`。
+
+驱动基本不会使用[include/linux/fs.h.](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/fs.h) 中定义的各类接口直接覆写（fill） `struct file` ，只会调用 `struct file` 中包含的各结构体。
