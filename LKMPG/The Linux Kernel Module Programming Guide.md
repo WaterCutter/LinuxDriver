@@ -1,6 +1,6 @@
 # The Linux Kernel Module Programming Guide
 - Peter Jay Salzman, Michael Burian, Ori Pomerantz, Bob Mottram, Jim Huang
-
+- 译 断水客（WaterCutter）
 
 ## 5 预备知识（Preliminaries）
 
@@ -159,3 +159,59 @@ struct file_operations fops = {
 `struct file` 的指针（instance）通常被称为 `filp`。
 
 驱动基本不会使用[include/linux/fs.h.](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/fs.h) 中定义的各类接口直接覆写（fill） `struct file` ，只会调用 `struct file` 中包含的各结构体。
+
+### 6.3 注册设备
+
+如前所述，用户一般是通过 `/dev` 目录下的设备文件（device files）访问字符设备的。
+
+主设备号标明驱动处理哪个设备文件，次设备号只用于有多个设备时，驱动分辨正在使用的设备（which device is operating on）。
+
+向系统中添加一个设备意味着将这个设备注册到内核中。在模块初始化的时候会通过调用定义在 `include/linux/fs.h` 中的 `register_chrdev()` 函数为设备分配一个主设备号，其原型如下：
+
+```c
+int register_chrdev(unsigned int major, const char *name, struct file_operations *fops);
+```
+
+`major` 是主设备号，`name` 是可以在文件 `/proc/devices` 中看到的设备名，`*fops` 指向驱动中 file_operations 表的指针。函数返回负数表明设备注册失败。值得一提的是，这个函数不涉及次设备号，因为只有驱动才使用这个属性，内核并不关心次设备号。
+
+现在问题来了，如何才能获取一个没被使用的主设备号呢？最简单的方式是查看 [Documentation/admin-guide/devices.txt](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/Documentation/admin-guide/devices.txt) 然后选一个没有被占用的设备号。但这不是一个好办法，因为这个方法无法操作的互斥性，不能保证后续不会有其他设备使用同样的设备号。正确的答案是向内核请求一个动态的主设备号（ask the kernel to assign you a dynamic major number）。
+
+向函数 `register_chrdev()` 传参数 0 ，它的返回值就是 `dynamic major number`。这个办法的弊端在于，因为不确定设备注册时会获得哪个动态设备号，也就不能提前创建设备文件。又三种解决方案：
+
+1. 驱动打印输出主设备号，然后手动创建设备文件
+2. 新注册的设别会显示在 `/proc/devices` 文件中，可以通过读这个文件获取主设备号，然后手动/脚本创建设备文件
+3. 驱动在成功注册设备后，通过 `device_create()` 函数创建设备文件，并在 `cleanup_module()` 函数中调用函数 `device_destroy()`。
+
+不过，`register_chrdev()` 函数会占用一些和主设备号相关的次设备号，推荐使用 cdev interface 注册字符设备以减少对次设备号的浪费。
+
+使用 cdev interface 注册字符设备分两步走。
+
+第一步，调用 `register_chrdev_region()` 或者  `alloc_chrdev_region()` 注册一系列设备号（register a range of device numbers）。
+
+```c
+int register_chrdev_region(dev_t from, unsigned count, const char *name); 
+int alloc_chrdev_region(dev_t *dev, unsigned baseminor, unsigned count, const char *name);
+```
+
+如果指定设备号，使用 `register_chrdev_region()`，否则使用 `alloc_chrdev_region()`。
+
+第二步，使用下面的方法为字符设备初始化结构体 `struct cdev`，并将它和第一步注册的 device number 关联起来（associate it with the device numbers）。
+
+```c
+struct cdev *my_dev = cdev_alloc(); 
+my_cdev->ops = &my_fops;
+```
+
+上面是 `cdev` 单独存在的情况，更常规的情况是，设备驱动的 `fops` 中包含这个结构体，那就要用到 `cdev_init()` 函数了，原型如下：
+
+```c
+void cdev_init(struct cdev *cdev, const struct file_operations *fops);
+```
+
+完成初始化后，可用 `cdev_add()` 函数将字符设备添加到系统中，函数原型如下：
+
+```c
+int cdev_add(struct cdev *p, dev_t dev, unsigned count);
+```
+
+上述各种用法，可以在第 9 章中找到使用范例。
