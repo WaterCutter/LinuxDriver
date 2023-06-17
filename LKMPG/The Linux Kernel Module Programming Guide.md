@@ -214,4 +214,16 @@ void cdev_init(struct cdev *cdev, const struct file_operations *fops);
 int cdev_add(struct cdev *p, dev_t dev, unsigned count);
 ```
 
-上述各种用法，可以在第 9 章中找到使用范例。
+上述各种用法，可以在第 9 章提到的`ioctl.c`中找到使用范例。
+
+### 6.4 注销（unregistering）设备
+
+即使拥有 root 权限，也不能随意使用 rmmod 命令（allow module to be rmmoded whenever root feels like）。假设在某个进程大打开了设备文件的情况下注销对应的模块，对设备文件的操作将会导致不可预知的后果——运气好的话（模块原在的位置没有重装其他代码），会收到一个错误信息；运气不好的话（重装了其他代码），那就会导致意料之外的操作被执行，这肯定不是什么好事（they can not be very positive）。
+
+使用 `cat /proc/modules` 或者 `sudo lsmod .` 命令可以在回显信息的第 3 栏看到各模块被多少个进程使用。如果对应值不为 0，`rmmod` 将失败。注意编写模块时不必在 `cleanup_module` 里检查这个计数值，因为定义在 [include/linux/syscalls.h](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/module.h) 中的系统调用 `sys_delete_module` 会干这个事。咱可以使用下面几个定义在 [include/linux/module.h](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/module.h) 中的函数增减和查询这个计数器的值：
+
+- try_module_get(THIS_MODULE) : Increment the reference count of current module.
+- module_put(THIS_MODULE) : Decrement the reference count of current module.
+- module_refcount(THIS_MODULE) : Return the value of reference count of current module.
+
+必须严格保证上述计数器的准确性，否则会导致模块永远无法被卸载（即使没有后进程使用，计数器也不为0， `rmmod` 一直失败）。
