@@ -75,7 +75,7 @@ crw-rw----  1 root  dial 4, 67 Jul  5  2000 /dev/ttyS3
 
 安装系统时，所有这些设备文件都是由 `mknod` 命令创建的。要创建一个名为 coffee 的新字符设备，主要/次要编号为 12 和 2，只需执行 `mknod /dev/coffee c 12 2` 。您不必将设备文件放入 `/dev` 中，但这是按照惯例完成的。Linus 将他的设备文件放在 `/dev` 中，你也应该如此。但是，在创建用于测试目的的设备文件时，可能可以将其放在编译内核模块的工作目录中。只需确保在编写完设备驱动程序后将其放在正确的位置即可。
 
-# 6 字符设备驱动
+## 6 字符设备驱动
 
 [include/linux/fs.h](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/fs.h) 中定义了结构体 `file_operations` ，这个结构体包含指向再设备上执行各种操作的系列函数。结构体的每一字段都对应着驱动中定义的处理请求的函数的地址。
 
@@ -404,4 +404,99 @@ MODULE_LICENSE("GPL");
 
 > The way to do this to compare the macro LINUX_VERSION_CODE to the macro KERNEL_VERSION . In version a.b.c of the kernel, the value of this macro would be 2^16×a + 28×b + c.
 
+## 7 /proc 文件系统
 
+Linux 中有一个额外的机制——/proc file system，用于支持内核和模块向进程（processes）发送信息。
+
+这个机制最设计为访问进程信息，现在用于内核报告（used by every bit of the kernel which has something interesting to report）,这些报告包括提供模块列表的 `/proc/modules` 文件、收集内存使用情况的 `/proc/meminfo` 文件。
+
+/proc 文件系统的用法与设备驱动类似——创建一个包含 /proc 文件信息和多个句柄函数（handler function）的指针的结构体，使用 `init_module` 注册，使用 `cleanup_module` 注销。
+
+常规的（normal）文件系统在磁盘（disk）上，而 /proc 在内存（memory）中，`inode number` 是一个指向文件在磁盘上的位置的指针。`inode` 中包含文件的权限、指向文件数据在磁盘中的位置的指针。
+
+因为此类文件在被打开或者关闭时不会收到调用，开发者也就无处调用 `try_module_get()` 和 `module_put()` （见第 6 章对这两个函数的说明）, 这也意味着文件打开时模块可以被移除。
+
+下面是一个使用 /proc 文件的例程，包含初始化函数 `init_module()`、返回一个值和 buffer 的读取函数 `procfile_read()` 以及删除文件 `/proc/helloworld` 的函数 `cleanup_module()`。
+
+模块被函数 `proc_create()` 加载时将创建文件 `/proc/helloworld`。类型为 `struct proc_dir_entry` 的返回值将被用于配置文件 `/proc/helloworld` ，返回值为 `NULL` 则意味着创建文件失败。
+
+每当文件 `proc/helloworld` 被读取时，函数 `procfile_read()` 就会被调用。这个函数的第二个参数 `buffer` 和第四个参数 `offset` 十分重要。 `buffer` 的内容将被传递给读取该文件的应用程序（例如 cat 命令）， `offset` 则标记文件当前的读取位置。如果该函数的返回值不为 `NULL` ，则将被不停地调用（called endlessly）。
+
+> $ cat /proc/helloworld
+HelloWorld!
+
+```c
+/* 
+ * procfs1.c 
+ */ 
+ 
+#include <linux/kernel.h> 
+#include <linux/module.h> 
+#include <linux/proc_fs.h> 
+#include <linux/uaccess.h> 
+#include <linux/version.h> 
+ 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0) 
+#define HAVE_PROC_OPS 
+#endif 
+ 
+#define procfs_name "helloworld" 
+ 
+static struct proc_dir_entry *our_proc_file; 
+ 
+static ssize_t procfile_read(struct file *file_pointer, char __user *buffer, 
+                             size_t buffer_length, loff_t *offset) 
+{ 
+    char s[13] = "HelloWorld!\n"; 
+    int len = sizeof(s); 
+    ssize_t ret = len; 
+ 
+    if (*offset >= len || copy_to_user(buffer, s, len)) { 
+        pr_info("copy_to_user failed\n"); 
+        ret = 0; 
+    } else { 
+        pr_info("procfile read %s\n", file_pointer->f_path.dentry->d_name.name); 
+        *offset += len; 
+    } 
+ 
+    return ret; 
+} 
+ 
+#ifdef HAVE_PROC_OPS 
+static const struct proc_ops proc_file_fops = { 
+    .proc_read = procfile_read, 
+}; 
+#else 
+static const struct file_operations proc_file_fops = { 
+    .read = procfile_read, 
+}; 
+#endif 
+ 
+static int __init procfs1_init(void) 
+{ 
+    our_proc_file = proc_create(procfs_name, 0644, NULL, &proc_file_fops); 
+    if (NULL == our_proc_file) { 
+        proc_remove(our_proc_file); 
+        pr_alert("Error:Could not initialize /proc/%s\n", procfs_name); 
+        return -ENOMEM; 
+    } 
+ 
+    pr_info("/proc/%s created\n", procfs_name); 
+    return 0; 
+} 
+ 
+static void __exit procfs1_exit(void) 
+{ 
+    proc_remove(our_proc_file); 
+    pr_info("/proc/%s removed\n", procfs_name); 
+} 
+ 
+module_init(procfs1_init); 
+module_exit(procfs1_exit); 
+ 
+MODULE_LICENSE("GPL");
+```
+
+### 7.1 proc_ops 结构体
+
+proc_ops 结构体定义在 5.6 及更高版本 Linux 内核的 [ include/linux/proc_fs.h ](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/proc_fs.h) 文件中。旧版本内核使用  file_operations /proc 文件系统的用户钩子（user hooks）。但它包含一些在 VFS 中不必要的成员，并且每次 VFS 扩展 file_operations 集时，/proc 代码都会变得臃肿。除此之外，proc_ops 结构不仅节省了空间，还节省了一些操作以提高其性能。例如，在 /proc 中永远不会消失的文件可以将proc_flag设置为PROC_ENTRY_PERMANENT，以在每个 open/read/close 序列中省去 2 个原子操作、1 个allocation、1 个free 。
