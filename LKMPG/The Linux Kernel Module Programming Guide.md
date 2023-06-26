@@ -500,3 +500,112 @@ MODULE_LICENSE("GPL");
 ### 7.1 proc_ops 结构体
 
 proc_ops 结构体定义在 5.6 及更高版本 Linux 内核的 [ include/linux/proc_fs.h ](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/proc_fs.h) 文件中。旧版本内核使用  file_operations /proc 文件系统的用户钩子（user hooks）。但它包含一些在 VFS 中不必要的成员，并且每次 VFS 扩展 file_operations 集时，/proc 代码都会变得臃肿。除此之外，proc_ops 结构不仅节省了空间，还节省了一些操作以提高其性能。例如，在 /proc 中永远不会消失的文件可以将proc_flag设置为PROC_ENTRY_PERMANENT，以在每个 open/read/close 序列中省去 2 个原子操作、1 个allocation、1 个free 。
+
+### 7.2 读写 /proc 文件
+
+7.1 节中展示了一个简单的 /proc 文件读取操作，这里我们尝试写入 /proc 文件。二者非常类似，但写 /proc 的数据来自于用户，所以咱需要用 `copy_from_user` 或者 `get_user` 把数据从用户空间（user space）导入（import）到内核空间（kernel space）。
+
+> The reason for copy_from_user or get_user is that Linux memory (on Intel architecture, it may be different under some other processors) is segmented. This means that a pointer, by itself, does not reference a unique location in memory, only a location in a memory segment, and you need to know which memory segment it is to be able to use it. There is one memory segment for the kernel, and one for each of the processes.
+
+> The only memory segment accessible to a process is its own, so when writing regular programs to run as processes, there is no need to worry about segments. When you write a kernel module, normally you want to access the kernel memory segment, which is handled automatically by the system. However, when the content of a memory buffer needs to be passed between the currently running process and the kernel, the kernel function receives a pointer to the memory buffer which is in the process segment. The put_user and get_user macros allow you to access that memory. These functions handle only one character, you can handle several characters with copy_to_user and copy_from_user . As the buffer (in read or write function) is in kernel space, for write function you need to import data because it comes from user space, but not for the read function because data is already in kernel space.
+
+```c
+/* 
+ * procfs2.c -  create a "file" in /proc 
+ */ 
+ 
+#include <linux/kernel.h> /* We're doing kernel work */ 
+#include <linux/module.h> /* Specifically, a module */ 
+#include <linux/proc_fs.h> /* Necessary because we use the proc fs */ 
+#include <linux/uaccess.h> /* for copy_from_user */ 
+#include <linux/version.h> 
+ 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0) 
+#define HAVE_PROC_OPS 
+#endif 
+ 
+#define PROCFS_MAX_SIZE 1024 
+#define PROCFS_NAME "buffer1k" 
+ 
+/* This structure hold information about the /proc file */ 
+static struct proc_dir_entry *our_proc_file; 
+ 
+/* The buffer used to store character for this module */ 
+static char procfs_buffer[PROCFS_MAX_SIZE]; 
+ 
+/* The size of the buffer */ 
+static unsigned long procfs_buffer_size = 0; 
+ 
+/* This function is called then the /proc file is read */ 
+static ssize_t procfile_read(struct file *file_pointer, char __user *buffer, 
+                             size_t buffer_length, loff_t *offset) 
+{ 
+    char s[13] = "HelloWorld!\n"; 
+    int len = sizeof(s); 
+    ssize_t ret = len; 
+ 
+    if (*offset >= len || copy_to_user(buffer, s, len)) { 
+        pr_info("copy_to_user failed\n"); 
+        ret = 0; 
+    } else { 
+        pr_info("procfile read %s\n", file_pointer->f_path.dentry->d_name.name); 
+        *offset += len; 
+    } 
+ 
+    return ret; 
+} 
+ 
+/* This function is called with the /proc file is written. */ 
+static ssize_t procfile_write(struct file *file, const char __user *buff, 
+                              size_t len, loff_t *off) 
+{ 
+    procfs_buffer_size = len; 
+    if (procfs_buffer_size > PROCFS_MAX_SIZE) 
+        procfs_buffer_size = PROCFS_MAX_SIZE; 
+ 
+    if (copy_from_user(procfs_buffer, buff, procfs_buffer_size)) 
+        return -EFAULT; 
+ 
+    procfs_buffer[procfs_buffer_size & (PROCFS_MAX_SIZE - 1)] = '\0'; 
+    *off += procfs_buffer_size; 
+    pr_info("procfile write %s\n", procfs_buffer); 
+ 
+    return procfs_buffer_size; 
+} 
+ 
+#ifdef HAVE_PROC_OPS 
+static const struct proc_ops proc_file_fops = { 
+    .proc_read = procfile_read, 
+    .proc_write = procfile_write, 
+}; 
+#else 
+static const struct file_operations proc_file_fops = { 
+    .read = procfile_read, 
+    .write = procfile_write, 
+}; 
+#endif 
+ 
+static int __init procfs2_init(void) 
+{ 
+    our_proc_file = proc_create(PROCFS_NAME, 0644, NULL, &proc_file_fops); 
+    if (NULL == our_proc_file) { 
+        proc_remove(our_proc_file); 
+        pr_alert("Error:Could not initialize /proc/%s\n", PROCFS_NAME); 
+        return -ENOMEM; 
+    } 
+ 
+    pr_info("/proc/%s created\n", PROCFS_NAME); 
+    return 0; 
+} 
+ 
+static void __exit procfs2_exit(void) 
+{ 
+    proc_remove(our_proc_file); 
+    pr_info("/proc/%s removed\n", PROCFS_NAME); 
+} 
+ 
+module_init(procfs2_init); 
+module_exit(procfs2_exit); 
+ 
+MODULE_LICENSE("GPL");
+```
