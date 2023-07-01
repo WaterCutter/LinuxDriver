@@ -736,3 +736,145 @@ MODULE_LICENSE("GPL");
 仍觉得例程不够丰富？有传言称procfs即将被淘汰，建议考虑使用sysfs代替。如果想自己记录一些与内核相关的内容，再考虑使用这种机制。
 
 > Consider using this mechanism, in case you want to document something kernel related yourself.
+
+### 7.4 使用 seq_file 管理 /proc 文件
+
+如你所见，/proc 文件可能有些复杂，故而有一组名为 `seq_file` 有助于格式化输出的 API, 这组 API 基于一个由 `start()`、 `next()`、 `stop()` 等 3 个函数组成的操作序列（sequence）。当用户读取 /proc 文件时， `seq_file` 会启动这个操作序列，其内容如下：
+
+- 调用函数 `start()`。
+- 如果 `start()` 返回值非 NULL，调用函数 `next()`。这个函数是一个迭代器（iterator），用于遍历数据（go through all the data）。每次 `next()` 被调用时，也调用函数 `show()`，把用户要读取的数据写到缓冲区。
+- `next()` 返回值不为 NULL，重复调用 `next()`。
+- `next()` 返回值为 NULL，调用函数 `stop()`。
+
+注意：调用函数 `stop()` 之后又会调用函数 `start()`，直到函数 `start()` 返回值为 NULL
+
+`sqe_file` 为 `proc_ops` 提供了 `seq_read`、`seq_lseek` 等基本函数，但不提供写 /proc 文件的函数。下面是使用例程：
+
+```c
+/* 
+ * procfs4.c -  create a "file" in /proc 
+ * This program uses the seq_file library to manage the /proc file. 
+ */ 
+ 
+#include <linux/kernel.h> /* We are doing kernel work */ 
+#include <linux/module.h> /* Specifically, a module */ 
+#include <linux/proc_fs.h> /* Necessary because we use proc fs */ 
+#include <linux/seq_file.h> /* for seq_file */ 
+#include <linux/version.h> 
+ 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0) 
+#define HAVE_PROC_OPS 
+#endif 
+ 
+#define PROC_NAME "iter" 
+ 
+/* This function is called at the beginning of a sequence. 
+ * ie, when: 
+ *   - the /proc file is read (first time) 
+ *   - after the function stop (end of sequence) 
+ */ 
+static void *my_seq_start(struct seq_file *s, loff_t *pos) 
+{ 
+    static unsigned long counter = 0; 
+ 
+    /* beginning a new sequence? */ 
+    if (*pos == 0) { 
+        /* yes => return a non null value to begin the sequence */ 
+        return &counter; 
+    } 
+ 
+    /* no => it is the end of the sequence, return end to stop reading */ 
+    *pos = 0; 
+    return NULL; 
+} 
+ 
+/* This function is called after the beginning of a sequence. 
+ * It is called untill the return is NULL (this ends the sequence). 
+ */ 
+static void *my_seq_next(struct seq_file *s, void *v, loff_t *pos) 
+{ 
+    unsigned long *tmp_v = (unsigned long *)v; 
+    (*tmp_v)++; 
+    (*pos)++; 
+    return NULL; 
+} 
+ 
+/* This function is called at the end of a sequence. */ 
+static void my_seq_stop(struct seq_file *s, void *v) 
+{ 
+    /* nothing to do, we use a static value in start() */ 
+} 
+ 
+/* This function is called for each "step" of a sequence. */ 
+static int my_seq_show(struct seq_file *s, void *v) 
+{ 
+    loff_t *spos = (loff_t *)v; 
+ 
+    seq_printf(s, "%Ld\n", *spos); 
+    return 0; 
+} 
+ 
+/* This structure gather "function" to manage the sequence */ 
+static struct seq_operations my_seq_ops = { 
+    .start = my_seq_start, 
+    .next = my_seq_next, 
+    .stop = my_seq_stop, 
+    .show = my_seq_show, 
+}; 
+ 
+/* This function is called when the /proc file is open. */ 
+static int my_open(struct inode *inode, struct file *file) 
+{ 
+    return seq_open(file, &my_seq_ops); 
+}; 
+ 
+/* This structure gather "function" that manage the /proc file */ 
+#ifdef HAVE_PROC_OPS 
+static const struct proc_ops my_file_ops = { 
+    .proc_open = my_open, 
+    .proc_read = seq_read, 
+    .proc_lseek = seq_lseek, 
+    .proc_release = seq_release, 
+}; 
+#else 
+static const struct file_operations my_file_ops = { 
+    .open = my_open, 
+    .read = seq_read, 
+    .llseek = seq_lseek, 
+    .release = seq_release, 
+}; 
+#endif 
+ 
+static int __init procfs4_init(void) 
+{ 
+    struct proc_dir_entry *entry; 
+ 
+    entry = proc_create(PROC_NAME, 0, NULL, &my_file_ops); 
+    if (entry == NULL) { 
+        remove_proc_entry(PROC_NAME, NULL); 
+        pr_debug("Error: Could not initialize /proc/%s\n", PROC_NAME); 
+        return -ENOMEM; 
+    } 
+ 
+    return 0; 
+} 
+ 
+static void __exit procfs4_exit(void) 
+{ 
+    remove_proc_entry(PROC_NAME, NULL); 
+    pr_debug("/proc/%s removed\n", PROC_NAME); 
+} 
+ 
+module_init(procfs4_init); 
+module_exit(procfs4_exit); 
+ 
+MODULE_LICENSE("GPL");
+```
+
+通过下面几个页面获取更多信息：
+
+- [https://lwn.net/Articles/22355/](https://lwn.net/Articles/22355/)
+
+- [https://kernelnewbies.org/Documents/SeqFileHowTo](https://kernelnewbies.org/Documents/SeqFileHowTo)
+
+- [fs/seq_file.c ](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/seq_file.c)
