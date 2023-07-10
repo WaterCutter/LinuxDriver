@@ -1011,3 +1011,217 @@ sudo rmmod hello_sysfs
 在上面的例子中，我们使用一个简单的 kobject 在 `sysfs` 下创建了一个目录并与其属性通信。从 Linux v2.6.0 开始，kobject 结构就出现了。它最初旨在作为统一内核代码的简单方法，用于管理引用计数的对象。经过一些任务蠕变，它现在是大部分设备模型与其 sysfs 接口之间的中间件（glue）。
 
 [Documentation/driver-api/driver-model/driver.rst and https://lwn.net/Articles/51437/.](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/Documentation/driver-api/driver-model/driver.rst) 有关于 kobject 和 `sysfs` 的更多信息。
+
+## 9 谈及设备文件
+
+设备文件被用于表示物理设备。多数物理设备既被用于输入，也被用作输出，所以有一些机制用于支持内核从进程获取输出，然后传送给设备。
+
+上述需求可以通过打开设备文件并向该文件写入数据实现，这和写入普通文件没有太多区别。下面的例子中，我们使用 `device_weite` 函数来做这件事。
+
+但 `device_weite` 并不能满足我们的所有需求。设想我们通过串口连接一个 modem（即使这是一个内置的modem，从 CPU 的角度看，仍是通过串口连接的，所以这种设想并不费力）。一般情况下（the natural thing to do），使用设备文件向 modem 写数据或指令，读指令的应答或者收到的数据。但问题是，当你需要直接与串口通信——比如配置串口发送和接受数据的速率该怎么办呢？
+
+答案是 Unix 使用一种被称作 ioctl（Inout and Output Control） 的特殊函数。每个设备都有自己的 ioctl 函数，这些命令可以读取 ioctl 命令（将信息从进程发送到内核），写入 ioctl 命令（将信息返回到进程），两者兼而有之，或者两者都没有。请注意，这里读取和写入的角色再次颠倒，在 ioctl 中，读取是向内核发送信息，写入是从内核接收信息。
+
+ioctl 函数有三个参数：
+- 对应设备文件的文件描述符
+- ioctl 编号
+- ioctl 参数，该参数为 long 类型，因此您可以使用强制转换使用它来传递任何内容。您将无法以这种方式传递结构，但可以传递指向该结构的指针，下面是一个示例：
+
+```c
+/* 
+ * ioctl.c 
+ */ 
+#include <linux/cdev.h> 
+#include <linux/fs.h> 
+#include <linux/init.h> 
+#include <linux/ioctl.h> 
+#include <linux/module.h> 
+#include <linux/slab.h> 
+#include <linux/uaccess.h> 
+ 
+struct ioctl_arg { 
+    unsigned int val; 
+}; 
+ 
+/* Documentation/ioctl/ioctl-number.txt */ 
+#define IOC_MAGIC '\x66' 
+ 
+#define IOCTL_VALSET _IOW(IOC_MAGIC, 0, struct ioctl_arg) 
+#define IOCTL_VALGET _IOR(IOC_MAGIC, 1, struct ioctl_arg) 
+#define IOCTL_VALGET_NUM _IOR(IOC_MAGIC, 2, int) 
+#define IOCTL_VALSET_NUM _IOW(IOC_MAGIC, 3, int) 
+ 
+#define IOCTL_VAL_MAXNR 3 
+#define DRIVER_NAME "ioctltest" 
+ 
+static unsigned int test_ioctl_major = 0; 
+static unsigned int num_of_dev = 1; 
+static struct cdev test_ioctl_cdev; 
+static int ioctl_num = 0; 
+ 
+struct test_ioctl_data { 
+    unsigned char val; 
+    rwlock_t lock; 
+}; 
+ 
+static long test_ioctl_ioctl(struct file *filp, unsigned int cmd, 
+                             unsigned long arg) 
+{ 
+    struct test_ioctl_data *ioctl_data = filp->private_data; 
+    int retval = 0; 
+    unsigned char val; 
+    struct ioctl_arg data; 
+    memset(&data, 0, sizeof(data)); 
+ 
+    switch (cmd) { 
+    case IOCTL_VALSET: 
+        if (copy_from_user(&data, (int __user *)arg, sizeof(data))) { 
+            retval = -EFAULT; 
+            goto done; 
+        } 
+ 
+        pr_alert("IOCTL set val:%x .\n", data.val); 
+        write_lock(&ioctl_data->lock); 
+        ioctl_data->val = data.val; 
+        write_unlock(&ioctl_data->lock); 
+        break; 
+ 
+    case IOCTL_VALGET: 
+        read_lock(&ioctl_data->lock); 
+        val = ioctl_data->val; 
+        read_unlock(&ioctl_data->lock); 
+        data.val = val; 
+ 
+        if (copy_to_user((int __user *)arg, &data, sizeof(data))) { 
+            retval = -EFAULT; 
+            goto done; 
+        } 
+ 
+        break; 
+ 
+    case IOCTL_VALGET_NUM: 
+        retval = __put_user(ioctl_num, (int __user *)arg); 
+        break; 
+ 
+    case IOCTL_VALSET_NUM: 
+        ioctl_num = arg; 
+        break; 
+ 
+    default: 
+        retval = -ENOTTY; 
+    } 
+ 
+done: 
+    return retval; 
+} 
+ 
+static ssize_t test_ioctl_read(struct file *filp, char __user *buf, 
+                               size_t count, loff_t *f_pos) 
+{ 
+    struct test_ioctl_data *ioctl_data = filp->private_data; 
+    unsigned char val; 
+    int retval; 
+    int i = 0; 
+ 
+    read_lock(&ioctl_data->lock); 
+    val = ioctl_data->val; 
+    read_unlock(&ioctl_data->lock); 
+ 
+    for (; i < count; i++) { 
+        if (copy_to_user(&buf[i], &val, 1)) { 
+            retval = -EFAULT; 
+            goto out; 
+        } 
+    } 
+ 
+    retval = count; 
+out: 
+    return retval; 
+} 
+ 
+static int test_ioctl_close(struct inode *inode, struct file *filp) 
+{ 
+    pr_alert("%s call.\n", __func__); 
+ 
+    if (filp->private_data) { 
+        kfree(filp->private_data); 
+        filp->private_data = NULL; 
+    } 
+ 
+    return 0; 
+} 
+ 
+static int test_ioctl_open(struct inode *inode, struct file *filp) 
+{ 
+    struct test_ioctl_data *ioctl_data; 
+ 
+    pr_alert("%s call.\n", __func__); 
+    ioctl_data = kmalloc(sizeof(struct test_ioctl_data), GFP_KERNEL); 
+ 
+    if (ioctl_data == NULL) 
+        return -ENOMEM; 
+ 
+    rwlock_init(&ioctl_data->lock); 
+    ioctl_data->val = 0xFF; 
+    filp->private_data = ioctl_data; 
+ 
+    return 0; 
+} 
+ 
+static struct file_operations fops = { 
+    .owner = THIS_MODULE, 
+    .open = test_ioctl_open, 
+    .release = test_ioctl_close, 
+    .read = test_ioctl_read, 
+    .unlocked_ioctl = test_ioctl_ioctl, 
+}; 
+ 
+static int __init ioctl_init(void) 
+{ 
+    dev_t dev; 
+    int alloc_ret = -1; 
+    int cdev_ret = -1; 
+    alloc_ret = alloc_chrdev_region(&dev, 0, num_of_dev, DRIVER_NAME); 
+ 
+    if (alloc_ret) 
+        goto error; 
+ 
+    test_ioctl_major = MAJOR(dev); 
+    cdev_init(&test_ioctl_cdev, &fops); 
+    cdev_ret = cdev_add(&test_ioctl_cdev, dev, num_of_dev); 
+ 
+    if (cdev_ret) 
+        goto error; 
+ 
+    pr_alert("%s driver(major: %d) installed.\n", DRIVER_NAME, 
+             test_ioctl_major); 
+    return 0; 
+error: 
+    if (cdev_ret == 0) 
+        cdev_del(&test_ioctl_cdev); 
+    if (alloc_ret == 0) 
+        unregister_chrdev_region(dev, num_of_dev); 
+    return -1; 
+} 
+ 
+static void __exit ioctl_exit(void) 
+{ 
+    dev_t dev = MKDEV(test_ioctl_major, 0); 
+ 
+    cdev_del(&test_ioctl_cdev); 
+    unregister_chrdev_region(dev, num_of_dev); 
+    pr_alert("%s driver removed.\n", DRIVER_NAME); 
+} 
+ 
+module_init(ioctl_init); 
+module_exit(ioctl_exit); 
+ 
+MODULE_LICENSE("GPL"); 
+MODULE_DESCRIPTION("This is test_ioctl module");
+```
+
+> You can see there is an argument called cmd in test_ioctl_ioctl() function. It is the ioctl number. The ioctl number encodes the major device number, the type of the ioctl, the command, and the type of the parameter. This ioctl number is usually created by a macro call ( _IO , _IOR , _IOW or _IOWR — depending on the type) in a header file. This header file should then be included both by the programs which will use ioctl (so they can generate the appropriate ioctl’s) and by the kernel module (so it can understand it). In the example below, the header file is chardev.h and the program which uses it is userspace_ioctl.c.
+
+如果你想在自己的内核模块中使用 ioctl，最好收到一个正式的 ioctl 分配，所以如果你不小心得到了别人的 ioctl，或者如果他们得到了你的，你就会知道出了问题。有关更多信息，请参阅内核源代码树 [Documentation/userspace-api/ioctl/ioctl-number.rst](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/Documentation/userspace-api/ioctl/ioctl-number.rst)
+
+此外，我们需要注意，对共享资源的并发访问将导致争用条件。解决方案是使用我们在 6.5 节中提到的原子比较和交换 （Atomic Compare-And-Swap） 来强制执行独占访问（ atomic Compare-And-Swap ）。
